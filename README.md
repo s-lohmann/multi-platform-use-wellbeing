@@ -32,4 +32,4 @@ The data were obtained from https://gss.norc.org/Documents/spss/2016_spss.zip . 
 
 Working paper, please cite as:
 
-Lohmann, S., & Zagheni, E. (2020). Multi-platform social media use: Little evidence of impacts on adult well-being. Manuscript in preparation.
+Lohmann, S., & Zagheni, E. (2020). _Multi-platform social media use: Little evidence of impacts on adult well-being._ PsyArXiv. https://doi.org/10.31234/osf.io/r46nd
