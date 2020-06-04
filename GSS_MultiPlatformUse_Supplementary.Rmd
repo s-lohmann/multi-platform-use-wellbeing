@@ -1,0 +1,1075 @@
+---
+title: "GSS 2016: Social Media Usage module"
+author: "Sophie Lohmann, Emilio Zagheni"
+date: "Last updated: `r format(Sys.Date(), '%B %d, %Y')`"
+header-includes:
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+output:
+  pdf_document:
+    toc: true
+---
+
+_Note:_ The goal of this supplementary document is to exactly reproduce the results, figures, and tables reported in the manuscript through the underlying R code and to generate additional plots that do not appear in the manuscript. The document is therefore structured parallel to the manuscript. 
+
+# 1. Introduction
+
+```{r setup, include = FALSE}
+run_boot = FALSE # if TRUE, rerun the propensity-score bootstrapping (2+ hours), if FALSE, use the results saved from last time
+set.seed(42) # for the bootstrapped weighted correlation tests
+```
+
+
+```{r packages, message = FALSE, warning = FALSE, echo = FALSE}
+# # if you would like to ensure package version compatibility, install all packages in their version from April 15, 2020.
+# # the checkpoint package can help with that process by running the following two lines:
+# # (will run in interactive mode, but does not work reliably while knitting the file)
+# library(checkpoint)
+# checkpoint("2020-04-15")
+
+library(knitr) # to customize R Markdown behavior
+library(kableExtra) # to customize R Markdown tables
+library(srvyr) # for handling weighted survey data (integrates survey package with the tidyverse)
+library(survey) # for handling weighted survey data
+library(jtools) # for handling weighted survey data (adds extra functions to the survey package)
+library(Hmisc) # to read in SPSS files
+library(psych) # to calculate Cronbach's alpha
+library(svglite) # to export graphs in SVG format
+library(scales) # to format numbers as percentages
+library(plyr) # for data manipulation. Needs to be loaded before tidyverse/dplyr to avoid namespace conflicts
+library(tidyverse) # for data manipulation and plotting
+library(broom) # to tidy results
+library(boot) # for bootstrap analyses
+library(gridExtra) # to arrange multiple panels of ggplot graphs in a single graph
+library(janitor)
+library(patchwork) # to combine ggplot objects into one graph
+library(cowplot) # for graphics options
+# gdata warning messages about perl interpreters and Excel integration can be ignored here, support for Excel files is not needed for this project
+
+# setting knitr options
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, fig.align = "center")
+options(knitr.kable.NA = '')
+kable = function(data, ...) { # overriding function to make booktabs = TRUE default
+  knitr::kable(data, booktabs = TRUE, ...)
+}
+
+
+# convenience function to format p-values in accordance with APA style
+print_p = function(x) ifelse(x < .001, "< .001", sprintf("= %.03f", x))
+```
+
+# 2. Method
+
+```{r data}
+dat = spss.get("GSS2016.sav")
+
+# collecting relevant variable names and giving them descriptive labels for plotting
+vars_platforms = c("facebook", "twitter", "tumblr", "snapchat", "vine", "instagrm", 
+                   "pinterst", "flickr", "whatsapp", "clssmtes", "linkedin", "googlesn")
+names(vars_platforms) = c("Facebook", "Twitter", "Tumblr", "Snapchat", "Vine", "Instagram", 
+                          "Pinterest", "Flickr", "WhatsApp", "Classmates", "LinkedIn", "Google+")
+
+vars_outcome = c("happy", "health", "cesd", "mntlhlth", "evbrkdwn", 
+                 "life", "satfin", "happy_relationship", 
+                 "soctrust", "socialconfidence")
+names(vars_outcome) = c("Happiness", "Health", "Depression", "Bad mental health days", "Ever breakdown", 
+                        "Exciting vs. dull life", "Financial satisfaction", "Relationship satisfaction", 
+                        "Social trust", "Confidence in soc. institutions")
+vars_outcome_std = paste0(vars_outcome, "_std")
+names(vars_outcome_std) = names(vars_outcome)
+
+vars_demogr = c("size", "hompop", "male", "age", "childs", 
+                "race.hispanic", "race.NHblack", "race.NHother", "ses", "foreign",
+                "religious", "politically.conservative")
+names(vars_demogr) = c("City size", "Household size", "Gender: Male", 
+                      "Age", "Nr of children", 
+                      "Race/Ethn.: Hispanic", "Race/Ethn.: Non-Hispanic Black",
+                      "Race/Ethn.: Non-Hispanic Other", "SES index", "Foreign family index",
+                      "Religiosity index", "Political conservatism index")
+vars_demogr_scaled = vars_demogr %>%
+  ifelse(. %in% c("male", "race.hispanic", "race.NHblack", "race.NHother"), 
+         ., paste0("scale(", ., ")"))
+names(vars_demogr_scaled) = ifelse(
+  vars_demogr %in% c("male", "race.hispanic", 
+                     "race.NHblack", "race.NHother"),
+  names(vars_demogr), paste0(names(vars_demogr), " (std.)"))
+
+vars_propensity = c(vars_demogr, "intstart", "region")
+names(vars_propensity) = c(names(vars_demogr), "Internet use start date", "Region")
+
+colnames(dat) = tolower(colnames(dat))
+
+# recoding frequency measurements on non-equidistant scales into weekly frequency
+# first calculating the approximate annual frequency of each response option:
+dat = mutate_at(dat, vars(starts_with("soc")), 
+                recode, 
+                `ALMOST DAILY` = 338, # 6.5 (6-7) times a week * 52 weeks
+                `SEV TIMES A WEEK` = 182, # 3.5 (2-5) times a week * 52 weeks
+                `SEV TIMES A MNTH` = 42, # 3.5 (2-5) times a month * 12 months
+                `ONCE A MONTH` = 12, 
+                `SEV TIMES A YEAR` = 6, 
+                `ONCE A YEAR` = 1, 
+                NEVER = 0)
+# then dividing by 52 to get weekly frequency for better interpretability:
+dat = mutate_at(dat, vars(starts_with("soc")), ~./52)
+
+# recoding self-report items from text labels into numbers
+dat = dat %>% 
+  mutate_if(~ is.factor(.) & all(levels(.) %in% c("Yes", "No", "YES", "NO")), 
+            recode, Yes = 1, No = 0, YES = 1, NO = 0) %>%
+  mutate_at(vars(starts_with("cesd")), recode, `None or almost none of the time` = 0, `Some of the time` = 1,
+            `Most of the time` = 2, `All or almost all of the time` = 3) %>%
+  mutate_at(vars(starts_with("con")), recode, `A GREAT DEAL` = 1, `ONLY SOME` = 0, `HARDLY ANY` = -1) %>%
+  mutate(
+    cesd3 = 3 - cesd3, # reverse-coded item
+    intrecnt = recode(intrecnt, `Yes, used Internet yesterday` = 1, `No, did not use Internet yesterday` = 0),
+    life = recode(life, EXCITING = 1, ROUTINE = 0, DULL = -1),
+    happy = recode(happy, `VERY HAPPY` = 1, `PRETTY HAPPY` = 0, `NOT TOO HAPPY` = -1),
+    health = recode(health, EXCELLENT = 2, GOOD = 1, FAIR = 0, POOR = -1),
+    mntlhlth = as.numeric(as.character(mntlhlth)),
+    mntlhlth_reversed = max(mntlhlth, na.rm = TRUE) - mntlhlth,
+    fair = recode(fair, FAIR = 1, DEPENDS = 0, `TAKE ADVANTAGE` = -1),
+    trust = recode(trust, `CAN TRUST` = 1, DEPENDS = 0, `Can't be too careful` = -1),
+    helpful = recode(helpful, HELPFUL = 1, DEPENDS = 0, `LOOKOUT FOR SELF` = -1),
+    hapmar = recode(hapmar, `VERY HAPPY` = 1, `PRETTY HAPPY` = 0, `NOT TOO HAPPY` = -1),
+    hapcohab = recode(hapcohab, `Very happy` = 1, `Pretty happy` = 0, `Not too happy` = -1),
+    happy_relationship = coalesce(hapmar, hapcohab),
+    satfin = recode(satfin, SATISFIED = 1, `MORE OR LESS` = 0, `NOT AT ALL SAT` = -1)
+  )
+
+# recode demographic items
+income16_levels = c(0, 1, 3, 4, 5, 6, 7, 8, 10, 12.5, 15, 17.5, 20, 22.5, 25, 
+                    30, 35, 40, 50, 60, 75, 90, 110, 130, 150, 170)*1000
+income16_midpoints = (income16_levels + c(income16_levels[-1], 300000) - 1)/2
+dat = dat %>% 
+  mutate(
+    region = str_remove_all(region, "\\."),
+    size = as.numeric(size)*1000,
+    hompop = as.numeric(hompop),
+    childs = as.numeric(str_replace(as.character(childs), "EIGHT OR MORE", "8")),
+    class_num = recode(class, `LOWER CLASS` = 1, `WORKING CLASS` = 2, `MIDDLE CLASS` = 3, `UPPER CLASS` = 4),
+    rank = 11-as.numeric(str_replace(str_replace(rank, "TOP", "10"), "BOTTOM", "1")), # recoding so that higher nr = higher status
+    age = as.numeric(ifelse(age == "89 OR OLDER", 89, as.character(age))),
+    male = ifelse(sex == "MALE", 1, 0),
+    income.min = as.numeric(as.character(factor(income16, levels(income16), income16_levels))),
+    income.midpoint = as.numeric(as.character(factor(income16, levels(income16), income16_midpoints))),
+    rincome.min = as.numeric(as.character(factor(rincom16, levels(rincom16), income16_levels))),
+    rincome.midpoint = as.numeric(as.character(factor(rincom16, levels(rincom16), income16_midpoints))),
+    prestg10 = as.numeric(as.character(prestg10)),
+    prestg105plus = as.numeric(as.character(prestg105plus)),
+    work = ifelse(wrkstat %in% c("WORKING FULLTIME", "WORKING PARTTIME"), 1, 0),
+    work.fulltime = ifelse(wrkstat %in% c("WORKING FULLTIME"), 1, 0),
+    race.white = ifelse(race == "WHITE", 1, 0),
+    race.black = ifelse(race == "BLACK", 1, 0),
+    race.hispanic = ifelse(hispanic == "NOT HISPANIC", 0, 1),
+    race.NHwhite = ifelse(race == "WHITE" & hispanic == "NOT HISPANIC", 1, 0),
+    race.NHblack = ifelse(race == "BLACK" & hispanic == "NOT HISPANIC", 1, 0),
+    race.NHother = ifelse(race == "OTHER" & hispanic == "NOT HISPANIC", 1, 0),
+    raceeth = ifelse(race.hispanic == 1, "Hispanic", 
+                     ifelse(race.white == 1, "Non-Hispanic White",
+                            ifelse(race.black == 1, "Non-Hispanic Black", "Non-Hispanic Other"))),
+    raceeth = relevel(factor(raceeth), "Non-Hispanic White"),
+    foreign.born = 1 - born,
+    foreign.parent = ifelse(parborn %in% c("DK FOR BOTH", "MOTHER; FA. DK", "FATHER; MO.DK"), NA,
+                            ifelse(parborn == "BOTH IN U.S", 0, 1)),
+    foreign.grandparents = as.numeric(str_replace(granborn, "ALL IN U.S", "0")),
+    rel = factor(ifelse(relig == "NONE", "Atheist", 
+                        ifelse(relig %in% c("PROTESTANT", "CATHOLIC", "CHRISTIAN", "ORTHODOX-CHRISTIAN",
+                                            "INTER-NONDENOMINATIONAL"), "Christian", 
+                               "Other"))),
+    reliten = recode(reliten, `NOT VERY STRONG` = 1, `SOMEWHAT STRONG` = 2, STRONG = 3),
+    relevents.services = ifelse(attend == "NEVER", 0, 
+                                ifelse(attend %in% c("LT ONCE A YEAR", "ONCE A YEAR", "SEVRL TIMES A YR"), 1,
+                                       ifelse(attend %in% c("ONCE A MONTH", "2-3X A MONTH", "NRLY EVERY WEEK"), 2,
+                                              ifelse(attend %in% c("EVERY WEEK", "MORE THN ONCE WK"), 3, NA)))),
+    relevents.other = ifelse(relactiv == "NEVER", 0, 
+                             ifelse(relactiv %in% c("LESS THAN ONCE A YEAR", "ABOUT ONCE OR TWICE A YEAR", 
+                                                    "SEVERAL TIMES A YEAR"), 1,
+                                    ifelse(relactiv %in% c("ABOUT ONCE A MONTH", "2-3 TIMES A MONTH", 
+                                                           "NRLY EVERY WEEK"), 2,
+                                           ifelse(relactiv %in% c("EVERY WEEK", "SEVERAL TIMES A WEEK", 
+                                                                  "ONCE A DAY", "SEVERAL TIMES A DAY"), 3, NA)))),
+    pol.vote = coalesce(as.character(dat$pres12), as.character(dat$if12who)), # who they actually voted or would have voted for
+    pol.vote = ifelse(pol.vote == "Other candidate (SPECIFY)", "Other", 
+                      ifelse(pol.vote == "Didn't vote for president", NA, pol.vote)),
+    pol.voteobama = ifelse(pol.vote == "Obama", 1, ifelse(pol.vote == "Romney", 0, NA)),
+    pol.conservative = as.numeric(polviews),
+    edu.degree = ifelse(degree == "LT HIGH SCHOOL", "No High-School degree", 
+                        ifelse(degree == "HIGH SCHOOL", "High-School degree", "College degree")),
+    edu.4yrcollege = ifelse(degree %in% c("BACHELOR", "GRADUATE"), 1, 0),
+    edu.gradschool = ifelse(degree == "GRADUATE", 1, 0)
+  )
+
+dat$raceeth_refHispanic = relevel(dat$raceeth, "Hispanic")
+
+dat$age_cat = cut(dat$age, c(18, seq(30, 80, 10), 100), right = FALSE)
+dat$income_cat = ifelse(
+  dat$income16 %in% c("UNDER $1 000", "$1 000 TO 2 999", "$3 000 TO 3 999", "$4 000 TO 4 999", 
+                      "$5 000 TO 5 999", "$6 000 TO 6 999", "$7 000 TO 7 999", "$8 000 TO 9 999"),
+  "$0 TO 9999",
+  ifelse(dat$income16 %in% c("$10000 TO 12499", "$12500 TO 14999", "$15000 TO 17499", "$17500 TO 19999"),
+         "$10000 TO 19999",
+         ifelse(dat$income16 %in% c("$20000 TO 22499", "$22500 TO 24999", "$25000 TO 29999"),
+                "$20000 TO 29999",
+                ifelse(dat$income16 %in% c("$30000 TO 34999", "$35000 TO 39999"),
+                       "$30000 TO 39999",
+                       as.character(dat$income16)))))
+
+dat = mutate(dat, 
+             intstart = as.numeric(as.character(intstart)),
+             snsmyear = as.numeric(as.character(snsmyear)))
+
+# defining sets of variables
+vars1 = c("size", "hompop", "male", "age", "childs")
+names(vars1) = c("City Size", "Household\nSize", "Gender: Male", "Age", "Nr of Children")
+vars2 = c("race.NHwhite", "race.NHblack", "race.hispanic")
+names(vars2) = c("Non-Hispanic\nWhite", "Non-Hispanic\nBlack", "Hispanic")
+vars3 = c("rank", "income.midpoint", "prestg105plus", "edu.4yrcollege", "work", "work.fulltime")
+names(vars3) = c("Social Rank", "Income", "Occupational\nPrestige", "College Degree", "Employed", "Employed\nFull-Time")
+vars4 = c("reliten", "relevents.services", "relevents.other", "pol.conservative", "pol.voteobama", "foreign.born", "foreign.parent", "foreign.grandparents")
+names(vars4) = c("Religiosity", "Religious Service\nAttendance", "Religious Events\nAttendance", "Politically\nConservative", "Vote for Obama\nin 2012", "Foreign-Born", "Foreign-Born\nParent", "Nr of Foreign-Born\nGrandparents")
+vars5 = c("socmedyear", "socmedyears_prop", "int.weekday", "int.weekend")
+names(vars5) = c("Social Media\nStart Date", "Social Media\nProportion of Life", "Internet Use\nWeekday (h)", "Internet Use\nWeekend Day (h)")
+
+
+# questionable reporting for snsmyear - 101 people said they started using platforms way before they were launched -> setting these values to missing
+# same thing for intstart, 87 people claimed to have used the internet before it opened to the public in 1991
+id_intstart = dat$id[which(!is.na(dat$intstart))]
+id_snsstart = dat$id[which(!is.na(dat$snsmyear))]
+dat = mutate(dat, 
+             intstart = ifelse(intstart < 1991, NA, intstart),
+             snsmyear = ifelse((snsmfrst %in% "Facebook" & snsmyear < 2004) | 
+                                 (snsmfrst %in% "Twitter" & snsmyear < 2006) | 
+                                 (snsmfrst %in% "Instagram" & snsmyear < 2010) |
+                                 (snsmfrst %in% "Linkedin" & snsmyear < 2003) |
+                                 (snsmfrst %in% "Snapchat" & snsmyear < 2010) |
+                                 (snsmfrst %in% "Tumblr" & snsmyear < 2007) |
+                                 (snsmfrst %in% "WhatsApp" & snsmyear < 2009) |
+                                 (snsmfrst %in% "Google+ - Google's social network platform" 
+                                  & snsmyear < 2011) |
+                                 (snsmfrst %in% "Pinterest" & snsmyear < 2011) |
+                                 (snsmfrst %in% "Flickr" & snsmyear < 2004) |
+                                 (snsmfrst %in% "Vine" & snsmyear < 2013) |
+                                 (snsmfrst %in% "Classmates" & snsmyear < 1995) |
+                                 (snsmfrst %in% "Youtube" & snsmyear < 2005) |
+                                 (snsmfrst %in% "Myspace" & snsmyear < 2003) |
+                                 (snsmfrst %in% "Reddit" & snsmyear < 2005),
+                               NA, snsmyear)
+)
+
+# excluding gaming, dating, and streaming sites from the list of SNS:
+dat = dat %>% 
+  mutate_at(vars(snsmot2a, snsmot2b, snsmot2c), 
+            ~ifelse(. %in% 
+                      c("Online Gaming", "Online Dating Sites", "Plenty of Fish", 
+                        "Tinder", "Spotify", "Not a Social Network"), NA, as.character(.))) %>%
+  mutate(snsmoth1 = as.numeric(!is.na(snsmot2a)) + as.numeric(!is.na(snsmot2b)) +
+           as.numeric(!is.na(snsmot2c))) # number of other social media networks used
+
+# examining platform use variables only among people who are using the internet in the first place:
+dat = dat %>% 
+  select(id, intuse, vars_platforms) %>% 
+  mutate_at(vars(-id, -intuse), ~ifelse(intuse == 0, 0, .)) %>%
+  set_names(c("id", "intuse", paste0(vars_platforms, "_all"))) %>%
+  right_join(dat, by = c("id", "intuse"))
+# the platformName_all variables are among ALL participants, even those who don't use the internet
+# the regular platformName variables index social media use only among internet users
+
+# combining hour and minute reports into a single time use index and capping daily time at 24h:
+dat = mutate(dat,
+             intwkdyh = as.numeric(as.character(intwkdyh)),
+             intwkenh = as.numeric(as.character(intwkenh)),
+             intwkdym = as.numeric(as.character(intwkdym))/60, # converting min into h
+             intwkenm = as.numeric(as.character(intwkenm))/60) # converting min into h
+dat$int.weekday = rowSums(dat[, c("intwkdyh", "intwkdym")], na.rm = TRUE)
+dat$int.weekday = ifelse(is.na(dat$intwkdyh) & is.na(dat$intwkdym), NA, 
+                         ifelse(dat$int.weekday > 24, 24, dat$int.weekday))
+dat$int.weekend = rowSums(dat[, c("intwkenh", "intwkenm")], na.rm = TRUE)
+dat$int.weekend = ifelse(is.na(dat$intwkenh) & is.na(dat$intwkenm), NA, 
+                         ifelse(dat$int.weekend > 24, 24, dat$int.weekend))
+
+# calculated variables
+dat = dat %>% 
+  rowwise() %>%
+  mutate( # do not set na.rm = TRUE for sums so that people who didn't answer the questions don't get coded as using 0 social networks
+    socmed = sum(c(twitter, facebook, instagrm, linkedin, snapchat, tumblr, whatsapp, googlesn, pinterst, flickr, vine, clssmtes, snsmoth1)),
+    socmed_all = ifelse(intuse == 0, 0, socmed), # among all participants, even those who don't use internet
+    socmedyear = ifelse(socmed == 0, NA, snsmyear),
+    socmedyears_prop = 1 - (socmedyear - (2016 - age))/age, # proportion of life spent using social media
+    socmed_binarycalc = as.numeric(socmed > 0),
+    socmed_binarycalc_all = ifelse(intuse == 0, 0, socmed_binarycalc), # among all participants, even those who don't use internet
+    socmed_binary = ifelse(socmed_binarycalc == 0, "No", "Yes"),
+    socmed_binary_all = ifelse(intuse == 0, "No", socmed_binary), # among all participants, even those who don't use internet
+    socmed_intensive = ifelse(socmed >= 6, 1, 0),
+    socmed_intensive_all = ifelse(intuse == 0, 0, socmed_intensive), # among all participants, even those who don't use internet
+    socmed_trinary = factor(ifelse(socmed == 0, "None", 
+                                   ifelse(between(socmed, 1, 5), "1-5", "6+")), c("None", "1-5", "6+"), ordered = TRUE),
+    soc = sum(c(socrel, socommun, socfrend, socbar)), # index of offline social behavior
+    soctrust = mean(c(trust, fair, helpful), na.rm = TRUE),
+    cesd = mean(c(cesd1, cesd2, cesd3, cesd4, cesd5), na.rm = TRUE),
+    wb = mean(c(happy, health, life), na.rm = TRUE)) %>%
+  ungroup()
+dat = mutate(dat, socmed_trinary_all = factor(ifelse(intuse == 0, "None", as.character(socmed_trinary)),
+                                              c("None", "1-5", "6+"), ordered = TRUE))
+dat$socialconfidence = select(dat, starts_with("con")) %>% rowMeans(na.rm = TRUE)
+
+dat$cesd135 = rowMeans(select(dat, cesd1, cesd3, cesd5), na.rm = TRUE)
+dat$restlesssleep = dat$cesd2
+dat$lonely = dat$cesd4
+
+# creating summary indices for SES and foreign family (by standardizing and averaging all relevant variables)
+dat$ses = dat %>%
+  select(socmed, vars3) %>%
+  mutate_all(~ifelse(is.na(socmed), NA, .)) %>%
+  select(-socmed) %>% 
+  mutate_all(scale) %>%
+  rowMeans(na.rm = TRUE)
+dat$foreign = dat %>%
+  select(socmed, foreign.born, foreign.parent, foreign.grandparents) %>%
+  mutate_all(~ifelse(is.na(socmed), NA, .)) %>%
+  select(-socmed) %>% 
+  mutate_all(scale) %>%
+  rowMeans(na.rm = TRUE)
+dat$religious = dat %>%
+  select(socmed, reliten, relevents.services, relevents.other) %>%
+  mutate_all(~ifelse(is.na(socmed), NA, .)) %>%
+  select(-socmed) %>% 
+  mutate_all(scale) %>%
+  rowMeans(na.rm = TRUE)
+dat$politically.conservative = dat %>%
+  select(socmed, pol.conservative, pol.voteobama) %>%
+  mutate(pol.voteobama = 1 - pol.voteobama) %>% # reversing this item so higher = more conservative
+  mutate_all(~ifelse(is.na(socmed), NA, .)) %>%
+  select(-socmed) %>% 
+  mutate_all(scale) %>%
+  rowMeans(na.rm = TRUE)
+vars6 = c("ses", "foreign", "religious", "politically.conservative")
+names(vars6) = c("SES index", "Foreign family index", "Religiosity index", "Political\nconservatism index")
+
+vars_plot = c(vars1, vars2[c("Non-Hispanic\nWhite", "Non-Hispanic\nBlack", "Hispanic")], vars5, vars6)
+
+# creating standardized versions of the outcome variables
+# (standardized within the sample of people who filled out the social media module)
+dat = dat %>% 
+  select(id, socmed, all_of(vars_outcome)) %>%
+  mutate_at(vars(-id, -socmed), ~ifelse(is.na(socmed), NA, as.vector(scale(.)))) %>%
+  set_names(c("id", "socmed", paste0(vars_outcome, "_std"))) %>%
+  right_join(dat, by = c("id", "socmed"))
+
+# calculating quartiles
+age_q = quantile(dat$age, na.rm = TRUE)
+dat$age_q = cut(dat$age, age_q, ordered_result = TRUE, include.lowest = TRUE)
+# rm(age_q)
+
+# weighting
+dat = mutate(dat, wtssall = as.numeric(as.character(wtssall)), id = as.vector(id))
+survey = dat %>% as_survey_design(id = vpsu, strata = vstrat, weights = wtssall, nest = TRUE) 
+```
+
+A total of *N* = `r length(which(!is.na(dat$socmed)))` respondents reported on their social media use, and on average, they were *M* = `r sprintf("%.02f", svymean(~age, filter(survey, !is.na(socmed)), na.rm = TRUE))`, *SD* = `r sprintf("%.02f", svysd(~age, filter(survey, !is.na(socmed)), na.rm = TRUE))` years old and `r sprintf("%.00f", 100*svymean(~sex, filter(survey, !is.na(socmed)), na.rm = TRUE)["sexFEMALE"])`% of them were women. Most participants (`r sprintf("%.00f", 100*svymean(~raceeth, filter(survey, !is.na(socmed)), na.rm = TRUE)["raceethNon-Hispanic White"])`%) were Non-Hispanic White, `r sprintf("%.00f", 100*svymean(~raceeth, filter(survey, !is.na(socmed)), na.rm = TRUE)["raceethNon-Hispanic Black"])`% were Non-Hispanic Black, `r sprintf("%.00f", 100*svymean(~raceeth, filter(survey, !is.na(socmed)), na.rm = TRUE)["raceethHispanic"])`% identified as Hispanic, and `r sprintf("%.00f", 100*svymean(~raceeth, filter(survey, !is.na(socmed)), na.rm = TRUE)["raceethNon-Hispanic Other"])`% reported another race. 
+
+`r length(setdiff(id_intstart, dat$id[which(!is.na(dat$intstart))]))` participants gave impossible values for the year that they had started to use the internet (i.e., before 1991) and `r length(setdiff(id_snsstart, dat$id[which(!is.na(dat$snsmyear))]))` gave impossible values for the year that they had started to use social media platforms (e.g., saying that Instagram had been their first social media platform and that they started in 2006, even though Instagram did not launch until 2010). These values were subsequently set to missing.
+
+```{r correlations}
+# calculate the weighted correlations that will be referred to in the text of the manuscript
+# rs and p-values are bootstrapped-based when sig.stats = TRUE and can therefore differ slightly each run
+cor_satfin.wt = svycor(~satfin+income.midpoint, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_happyincome.wt = svycor(~happy+income.midpoint, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_evbrkhealth.wt = svycor(~evbrkdwn+health, survey, na.rm = TRUE, sig.stats = TRUE) 
+cor_evbrkhappy.wt = svycor(~evbrkdwn+happy, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_evbrkcesd.wt = svycor(~evbrkdwn+cesd, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_evbrkmntl.wt = svycor(~evbrkdwn+mntlhlth, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_mntlhealth.wt = svycor(~mntlhlth+health, survey, na.rm = TRUE, sig.stats = TRUE) 
+cor_mntlhappy.wt = svycor(~mntlhlth+happy, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_cesdhealth.wt = svycor(~cesd+health, survey, na.rm = TRUE, sig.stats = TRUE)
+cor_cesdhappy.wt = svycor(~cesd+happy, survey, na.rm = TRUE, sig.stats = TRUE)
+```
+
+One more question asked participants to rate their satisfaction with their financial situation. Although this index of course was associated with income, the correlation was not strong enough to see financial satisfaction as a mere proxy for income, *r* = `r round(cor_satfin.wt$cors[1,2], 2)`.
+
+CES-D, Cronbach's $\alpha$ = `r round(psych::alpha(dat[, c("cesd1", "cesd2", "cesd3", "cesd4", "cesd5")])$total$raw_alpha, 2)`
+
+Social trust, Cronbach's $\alpha$ = `r round(psych::alpha(dat[, c("trust", "fair", "helpful")])$total$raw_alpha, 2)`
+
+Social confidence, Cronbach's $\alpha$ = `r round(psych::alpha(dat[, startsWith(colnames(dat), "con")])$total$raw_alpha, 2)`
+
+[referring to the item on mental breakdown:] In fact, this item showed only low-to-medium correlations with all other indicators of well-being in the survey, _r_ = `r round(cor_evbrkhappy.wt$cors[1,2], 2)` with happiness, _r_ = `r round(cor_evbrkhealth.wt$cors[1,2], 2)` with health, _r_ = `r round(cor_evbrkcesd.wt$cors[1,2], 2)` with depression, and _r_ = `r round(cor_evbrkmntl.wt$cors[1,2], 2)` with bad mental health days. 
+
+In fact, the number of bad mental health days seemed more closely related to self-rated physical health, _r_ = `r round(cor_mntlhealth.wt$cors[1,2], 2)`, than to happiness, _r_ = `r round(cor_mntlhappy.wt$cors[1,2], 2)`. 
+
+
+
+```{r}
+# Effective (non-missing) sample sizes per variable
+dat %>%
+  drop_na(socmed) %>%
+  select(vars_outcome) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "value") %>%
+  drop_na(value) %>%
+  group_by(Variable) %>%
+  count() %>%
+  kable(caption = "Supplementary Table 1: Sample sizes per variable") %>% kable_styling(full_width = FALSE, latex_options = "hold_position")
+```
+
+
+# 3. Results and Discussion
+
+## 3.1 The Demography of Social Media Users
+
+### 3.1.1 Prevalence
+
+Social media use was highly prevalent in the 2016 GSS data and only 11% were not on social media (numbers are adjusted for design and non-response weights; estimates may not sum up to 100 due to rounding). Typically, respondents used between 1 and 5 different platforms. However, a minority of respondents reported using 6 platforms or more. We termed this group of respondents *intensive social media users* (6+ platforms; `r 100*round(svymean(~socmed_trinary, survey, Ntotal = 1, na.rm = TRUE)["socmed_trinary6+"], 2)`%)) and used regression to evaluate which socio-demographic characteristics differentiate them from both *moderate users* (1-5 platforms; `r 100*round(svymean(~socmed_trinary, survey, Ntotal = 1, na.rm = TRUE)["socmed_trinary1-5"], 2)`%) and *non-users* (0 platforms; `r 100*round(svymean(~socmed_trinary, survey, Ntotal = 1, na.rm = TRUE)["socmed_trinary6+"], 2)`%)).
+
+
+### 3.1.2 General characteristics
+
+#### Table 1
+
+```{r}
+demogr_model_binary = svyglm(reformulate(paste0(vars_demogr_scaled, collapse = " + "),
+                                         "socmed_intensive"),
+                             survey, family = "quasibinomial")
+demogr_model_continuous = svyglm(reformulate(paste0(vars_demogr_scaled, collapse = " + "),
+                                             "socmed"),
+                                 survey)
+
+demogr_table = mutate(tidy(demogr_model_binary, conf.int = TRUE, exponentiate = TRUE), model = "binary") %>%
+  bind_rows(mutate(tidy(demogr_model_continuous, conf.int = TRUE), model = "continuous")) %>%
+  set_names(c("Predictor", "OR", "SE", "z", "p", "ci.lo", "ci.hi", "model")) %>%
+  mutate(Predictor = factor(Predictor, c("(Intercept)", vars_demogr_scaled),
+                            c("Intercept", names(vars_demogr_scaled))),
+         p.value = p,
+         p = ifelse(p < .001, "***", ifelse(p < .01, "**",
+                                            ifelse(p < .05, "*", ""))),
+         CI = sprintf("[%.02f, %.02f]", ci.lo, ci.hi),
+         CI = paste0(CI, " ", p)) %>%
+  pivot_wider(names_from = model, values_from = c(OR, SE, z, p, ci.lo, ci.hi, p.value, CI))
+  
+demogr_table %>%
+  select(Predictor, OR_binary, CI_binary, b = OR_continuous, CI_continuous) %>%
+  mutate(SD = c(NA, map_dbl(select(filter(dat, !is.na(socmed)), 
+                                   vars_demogr), 
+                            sd, na.rm = TRUE))) %>%
+  set_names(str_extract(names(.), "([^_]+)")) %>%
+  kable(digits = 2,
+        caption = "Table 1: Regressions of demographic predictors on intensive usage (logistic regression for binary outcome, linear regression for continuous number of platforms). Continuous predictors are centered and standardized, the original standard deviations are presented in the right-hand column.") %>% 
+  kable_styling(full_width = FALSE, latex_options = "hold_position") %>%
+  add_header_above(c("", "Intensive user (binary)" = 2, "Number of platforms" = 2, ""))
+```
+
+```{r}
+fct_proportions = function(s = survey, variable, varname = NULL, MARGIN = 0){
+  if(is.null(varname)) varname = variable
+  s = mutate(s, var = s$variables[[variable]])
+  if(variable == "sex"){
+    s = mutate(s, var = ifelse(sex == "MALE", "male", "female")) 
+  } 
+  
+  out = s %>%
+    filter(!is.na(socmed), !is.na(var)) %>%
+    group_by(socmed_trinary, var) %>%
+    summarise(n = survey_total()) %>%
+    mutate(Percenttotal = 100 * n / sum(n)) %>%
+    select(-n, -n_se) %>%
+    pivot_wider(names_from = var, values_from = Percenttotal) %>%
+    adorn_totals(name = "varsums") %>% 
+    adorn_totals("col", name = "socmedsums") %>%
+    pivot_longer(-starts_with("socmed"), names_to = "var", values_to = "Percenttotal") 
+  out = out %>% 
+    filter(socmed_trinary == "varsums") %>%
+    rename(varsums = Percenttotal) %>%
+    select(var, varsums) %>%
+    left_join(out, by = "var") %>%
+    filter(socmed_trinary != "varsums") %>%
+    mutate(socmed_trinary = factor(socmed_trinary, levels = c("6+", "1-5", "None")),
+           margin = MARGIN,
+           Percent.socmed = 100 * Percenttotal / socmedsums,
+           Percent.var = 100 * Percenttotal / varsums,
+           Percent = ifelse(margin == "var", Percent.var, ifelse(margin == "socmed", Percent.socmed, Percenttotal))) %>%
+    select(var, socmed_trinary, Percent)
+  return(out)
+}
+```
+
+```{r demographics}
+ttests = list()
+for(i in c(vars1, vars2, vars3, vars4, vars5, vars6)){
+  ttests[[i]] = svyttest(reformulate("socmed_intensive", i), survey) %>% 
+    unlist() %>% 
+    t() %>% 
+    as_tibble %>%
+    mutate(var = i, p.value = p.value.socmed_intensive) %>%
+    mutate_at(vars(-alternative, -method, -data.name, -var), as.numeric) %>%
+    select(var, everything())
+}
+ttests = bind_rows(ttests)
+
+print_t = function(v){
+  ttests %>% 
+    filter(var == v) %>%
+    mutate(t = paste0("(", round(parameter.df, 2), ") = ", round(statistic.t, 2)),
+           p = print_p(p.value)) %>%
+    select(t, p)
+}
+```
+
+*Controlling for all other demographic variables:* 
+social media users in general tended to be younger than non-users, and intensive social media users were again younger than moderate users, _OR_ = `r sprintf("%.02f", filter(demogr_table, Predictor == "Age (std.)")$OR_binary)` 95% CI `r filter(demogr_table, Predictor == "Age (std.)")$CI_binary` (see Figure 1 for distributions; see Supplementary Material for full regression table). Social media users in general were also substantially more likely to be female than non-users, and intensive social media users were more likely to be female than everyone else, _OR_ = `r sprintf("%.02f", 1/filter(demogr_table, Predictor == "Gender: Male")$OR_binary)` 95% CI `r sprintf("[%.02f, %.02f]", 1/filter(demogr_table, Predictor == "Gender: Male")$ci.hi_binary, 1/filter(demogr_table, Predictor == "Gender: Male")$ci.lo_binary)`. To illustrate, women made up `r sprintf("%.00f%%", filter(fct_proportions(survey, "sex", "Sex", MARGIN = "socmed"), socmed_trinary == "6+", var == "female")$Percent)` of intensive users in this sample, but only `r sprintf("%.00f%%", filter(fct_proportions(survey, "sex", "Sex", MARGIN = "socmed"), socmed_trinary == "1-5", var == "female")$Percent)` of moderate users and `r sprintf("%.00f%%", filter(fct_proportions(survey, "sex", "Sex", MARGIN = "socmed"), socmed_trinary == "None", var == "female")$Percent)` of non-users. 
+
+Regarding race and ethnicity, Hispanic participants were tendentially less likely to be intensive users, but only the contrast with Non-Hispanic Black participants reached significance, _OR_ = `r sprintf("%.02f", 1/filter(demogr_table, Predictor == "Race/Ethn.: Non-Hispanic Black")$OR_binary)` 95% CI `r sprintf("[%.02f, %.02f]", 1/filter(demogr_table, Predictor == "Race/Ethn.: Non-Hispanic Black")$ci.hi_binary, 1/filter(demogr_table, Predictor == "Race/Ethn.: Non-Hispanic Black")$ci.lo_binary)`. 
+People with high socio-economic status, _OR_ = `r sprintf("%.02f", filter(demogr_table, Predictor == "SES index (std.)")$OR_binary)` 95% CI `r str_remove_all(filter(demogr_table, Predictor == "SES index (std.)")$CI_binary, "\\*")`, more foreign-born family members, _OR_ = `r sprintf("%.02f", filter(demogr_table, Predictor == "Foreign family index (std.)")$OR_binary)` 95% CI `r str_remove_all(filter(demogr_table, Predictor == "Foreign family index (std.)")$CI_binary, "\\*")`, and higher religiosity, _OR_ = `r sprintf("%.02f", filter(demogr_table, Predictor == "Religiosity index (std.)")$OR_binary)` 95% CI `r str_remove_all(filter(demogr_table, Predictor == "Religiosity index (std.)")$CI_binary, "\\*")`, were all more likely to be intensive social media users. 
+
+Finally and as expected, intensive social media users had started using social media earlier both in absolute terms (year of start), *t*`r print_t("socmedyear")["t"]`, *p* `r print_t("socmedyear")["p"]`, and in relative terms (proportion of life using social media), *t*`r print_t("socmedyears_prop")["t"]`, *p* `r print_t("socmedyears_prop")["p"]`, compared to their more moderately-using counterparts. They also reported using the internet for almost an hour longer on both weekdays, *t*`r print_t("int.weekday")["t"]`, *p* `r print_t("int.weekday")["p"]`, and weekend days, *t*`r print_t("int.weekend")["t"]`, *p* `r print_t("int.weekend")["p"]`, than either non-users or moderate users.
+
+Results were similar when using the continuous number of used platforms as an outcome instead of classifying users as intensive versus not (see Supplemental Materials).
+
+```{r}
+ttests %>%
+  filter(p.value < .10) %>%
+  select(var, statistic.t, parameter.df, p.value) %>%
+  set_names(c("Variable", "t", "df", "p")) %>%
+  mutate(Variable = factor(Variable, c(vars1, vars2, vars3, vars4, vars5, vars6), 
+                           names(c(vars1, vars2, vars3, vars4, vars5, vars6)))) %>%
+  kable(digits = c(NA, 2, 0, 3), 
+        caption = "Supplementary Table 2: T-tests of intensive vs. both moderate and non-users. Only tests with p < .10 are shown.") %>% 
+  kable_styling(full_width = FALSE, latex_options = "hold_position")
+```
+
+*Without controlling for the other demographic variables:* Social media users in general tended to be younger than non-users, and intensive social media users were again younger than moderate users, *t*`r print_t("age")["t"]`, *p* `r print_t("age")["p"]` (for the comparison of intensive users versus everyone else; see Figure 1 for all patterns of means; see Supplementary Material for a table of t-tests). Social media users in general were also substantially more likely to be female than non-users, and intensive social media users were marginally more likely to be female than everyone else, *t*`r print_t("male")["t"]`, *p* `r print_t("male")["p"]`. Intensive social media users were more likely to identify as Non-Hispanic Black, *t*`r print_t("race.NHblack")["t"]`, *p* `r print_t("race.NHblack")["p"]`, and correspondingly marginally less likely to identify as Non-Hispanic White, *t*`r print_t("race.NHwhite")["t"]`, *p* `r print_t("race.NHwhite")["p"]`. Further, intensive users were significantly more likely to live in a larger city than either non-users or moderate users, *t*`r print_t("size")["t"]`, *p* `r print_t("size")["p"]`.
+Intensive social media users scored higher on several measures of SES. They assigned themselves higher ranks in society, *t*`r print_t("rank")["t"]`, *p* `r print_t("rank")["p"]`, reported higher incomes, *t*`r print_t("income.midpoint")["t"]`, *p* `r print_t("income.midpoint")["p"]`, held marginally more prestigious occupations, *t*`r print_t("prestg105plus")["t"]`, *p* `r print_t("prestg105plus")["p"]`, and were substantially more likely to hold a degree from a 4-year college, *t*`r print_t("edu.4yrcollege")["t"]`, *p* `r print_t("edu.4yrcollege")["p"]`. Despite slight visual trends in the means, there were no significant differences for employment status, *t*`r print_t("work")["t"]`, *p* `r print_t("work")["p"]`, or full-time employment, *t*`r print_t("work.fulltime")["t"]`, *p* `r print_t("work.fulltime")["p"]`. Intensive users did not differ significantly from non-users and moderate users on religious or political characteristics, although the patterns of means showed trends towards more participation in religious services (*t*`r print_t("relevents.services")["t"]`, *p* `r print_t("relevents.services")["p"]`) and events (*t*`r print_t("relevents.other")["t"]`, *p* `r print_t("relevents.other")["p"]`) and towards a higher chance of having voted (or intended to vote) for Obama in 2012, *t*`r print_t("pol.voteobama")["t"]`, *p* `r print_t("pol.voteobama")["p"]`.
+Finally and as expected, intensive social media users had started using social media earlier both in absolute terms (year of start), *t*`r print_t("socmedyear")["t"]`, *p* `r print_t("socmedyear")["p"]`, and in relative terms (proportion of life using social media), *t*`r print_t("socmedyears_prop")["t"]`, *p* `r print_t("socmedyears_prop")["p"]`, compared to their more moderately-using counterparts. They also reported using the internet for almost an hour longer on both weekdays, *t*`r print_t("int.weekday")["t"]`, *p* `r print_t("int.weekday")["p"]`, and weekend days, *t*`r print_t("int.weekend")["t"]`, *p* `r print_t("int.weekend")["p"]`, than either non-users or moderate users.
+
+\newpage
+
+
+```{r}
+# Means, CIs, and sample sizes for demographic variables by social media use
+means = survey %>%
+  filter(!is.na(socmed_trinary)) %>%
+  group_by(socmed_trinary) %>%
+  summarise_at(vars(c(vars1, vars2, vars5, vars6)), 
+               survey_mean, na.rm = TRUE, vartype = c("se", "ci")) %>%
+  # non-users cannot have a social media startdate, therefore set their values to missing for this variable:  
+  mutate_at(vars(starts_with("socmedyear")), ~ifelse(socmed_trinary == "None", NA, .)) %>%
+  gather("var", "value", -socmed_trinary) %>%
+  mutate(type = ifelse(str_detect(var, "_low"), "low",
+                       ifelse(str_detect(var, "_upp"), "upp", 
+                              ifelse(str_detect(var, "_se"), "SE", "M"))),
+         var = str_remove(str_remove(str_remove(var, "_upp"), "_low"), "_se"),) %>%
+  spread("type", "value") %>%
+  mutate(CI = paste0("[", round(low, 2), ", ", round(upp, 2), "]"),
+         Variable = rep(names(sort(c(vars1, vars2, vars5, vars6))), 3))
+
+means_ns = dat %>%
+  filter(!is.na(socmed_trinary)) %>%
+  select(socmed_trinary, any_of(as.vector(c(vars1, vars2, vars5, vars6)))) %>%
+  gather(var, value, -socmed_trinary) %>%
+  drop_na(value) %>% # remove NAs
+  group_by(socmed_trinary, var) %>%
+  count()
+means = left_join(means, means_ns, by = c("var", "socmed_trinary"))
+rm(means_ns)
+
+means_table = means %>%
+  filter(CI != "[NA, NA]") %>%
+  select(socmed_trinary, Variable, M, CI, n) %>%
+  pivot_wider(names_from = socmed_trinary, values_from = c(M, CI, n))
+means_table = means_table[, c(1, 2, 2+3, 2+6, 3, 3+3, 3+6, 4, 4+3, 4+6)]
+colnames(means_table) = str_split(colnames(means_table), "_", simplify = TRUE)[,1]
+means_table %>%
+  kable(digits = c(NA, rep(c(2, NA, 0), 3)),
+        caption = "Supplementary Table 3: Means, CIs, and sample sizes of demographic variables") %>% 
+  kable_styling(full_width = FALSE, 
+                latex_options = c("scale_down", "hold_position")) %>%
+  add_header_above(c(" ", "None" = 3, "1-5" = 3, "6+" = 3))
+```
+
+#### Figure 1
+
+```{r Figure1, fig.width=8, fig.height=5, fig.cap = "Figure 1. Weighted density curves, means, and 95% CI error bars of age and SES by social media use."}
+fct_densityplot = function(data = dat, variable, varname = NULL, showlegend = TRUE, color_values =  c(rgb(241, 201, 110, max = 255), rgb(250,157,63, max = 255), rgb(173, 1, 1, max = 255)), ...){
+  variable = enquo(variable)
+  if(is.null(varname)) varname = quo_name(variable)
+  
+  p = ggplot(drop_na(data, socmed_trinary), aes(x = !!variable, group = socmed_trinary, color = socmed_trinary)) +
+    theme_cowplot() +
+    xlab(varname) + 
+    ylab("Density") + 
+    geom_density(size = 1.02, ...) +
+    scale_color_manual(values = color_values, 
+                       guide = guide_legend(title = "Social media use"))
+  
+  if(isFALSE(showlegend)) p = p + guides(color = FALSE)
+  
+  px = axis_canvas(p, axis = "x") +
+    geom_point(aes(x = M, y = 1-as.numeric(socmed_trinary)/3, color = socmed_trinary), 
+               data = filter(means, var == quo_name(variable)), 
+               size = 5) +
+    geom_errorbarh(data = filter(means, var == quo_name(variable)), 
+                   aes(y = 1-as.numeric(socmed_trinary)/3, color = socmed_trinary, xmin = low, xmax = upp), 
+                   size = 1.2, height = .25) + 
+    scale_color_manual(values = color_values)
+  
+  # create the combined plot
+  combined_plot <- insert_xaxis_grob(p, px, position = "bottom")
+  # plot the resulting combined plot
+  ggdraw(combined_plot)
+}
+
+Figure1 = fct_densityplot(dat, age, "Age", showlegend = FALSE,
+                color_values = c("gray80", "gray55", "black")) + 
+  fct_densityplot(dat, ses, "SES",
+                  color_values = c("gray80", "gray55", "black")) + 
+  plot_layout(widths = c(1, 1.3))
+
+Figure1
+
+svg("Figure1.svg", width = 8, height = 5)
+Figure1
+invisible(dev.off())
+```
+
+```{r Figure1_supp, fig.width=8, fig.height=5, fig.cap = "Supplementary Figure 1. Weighted density curves, means, and 95% CI error bars of the religiosity and foreign-family indices by social media use."}
+fct_densityplot(dat, religious, "Religiosity index", showlegend = FALSE,
+                color_values = c("gray80", "gray55", "black")) + 
+  fct_densityplot(dat, foreign, "Foreign family index", adjust = 2,
+                  color_values = c("gray80", "gray55", "black")) +
+  plot_layout(widths = c(1, 1.3))
+```
+
+\newpage
+
+## 3.2 Multi-Platform Social Media Use and Well-Being
+
+### Table 2
+
+```{r Table2, asis = TRUE}
+cors.wt.all = svycor(
+  eval(parse(text = paste("~ socmed + soc + ", 
+                          paste0(vars_outcome, collapse = " + ")))), 
+  survey, na.rm = TRUE, sig.stats = TRUE)
+
+cors.wt.p = as.data.frame(rbind(
+  cors.wt.all$p.values[-c(1:2), c(1:2)], 
+  cors.wt.all$p.values[2, c(1:2)]))
+cors.wt = as.data.frame(cbind(
+  c(names(vars_outcome), "Offline social contact"),
+  rbind(
+    cors.wt.all$cors[-c(1:2), c(1:2)],
+    cors.wt.all$cors[2, c(1:2)]), 
+  cors.wt.p))
+
+colnames(cors.wt) = c("Outcome", "Online social contact", "Offline social contact", "online.p", "offline.p")
+
+cors.wt %>%
+  mutate(`Online social contact` = 
+           ifelse(online.p < .05, 
+                  sprintf("%.02f*", `Online social contact`),
+                  sprintf("%.02f", `Online social contact`)),
+         `Offline social contact` = 
+           ifelse(offline.p < .05, 
+                  sprintf("%.02f*", `Offline social contact`),
+                  sprintf("%.02f", `Offline social contact`)),
+         `Offline social contact` = 
+           ifelse(Outcome == "Offline social contact", 
+                  NA,
+                  ifelse(Outcome %in% c("Depression", "Depression (reduced scale)",
+                                        "Restless sleep", "Loneliness"), 
+                         "\\+", `Offline social contact`))) %>%
+  select(Outcome, `Online social contact`, `Offline social contact`) %>%
+  kable(digits = 2, caption = "Table 2. Correlations of Social Contact and Well-Being") %>%
+  kable_styling(full_width = FALSE, latex_options = "hold_position")
+```
+
+\* *p* < .05
+
+\+ could not be calculated because the variables were never administered in the same questionnaire
+
+
+\newpage
+\blandscape
+
+```{r}
+# controlling for the previously used set of demographic covariates:
+wb_ctrls = tibble()
+wb_ctrls_mod = list()
+for(ii in vars_outcome_std){
+  s = mutate(survey, scaled_ii = scale(get(ii)))
+  mod = svyglm(reformulate(paste0("socmed + ", paste(vars_demogr_scaled, collapse = " + ")), "scaled_ii"), s)
+  wb_ctrls_mod[[ii]] = mutate(tidy(mod, conf.int = TRUE), 
+                              Outcome = names(vars_outcome_std[which(vars_outcome_std == ii)]))
+  p.out = summary(mod)$coef
+  wb_ctrls = bind_rows(wb_ctrls, 
+                     p.out[-1, "Estimate"], 
+                     p.out[-1, "Std. Error"], 
+                     p.out[-1, "Pr(>|t|)"])
+}
+
+reduce(wb_ctrls_mod, bind_rows) %>%
+  set_names(c("Predictor", "b", "SE", "t", "p.value", "cilo", "cihi", "Outcome")) %>%
+  mutate(Predictor = factor(Predictor, unique(wb_ctrls_mod[[1]]$term), 
+                            c("Intercept", "# Social media platforms",
+                              names(vars_demogr_scaled))),
+         CI = sprintf("[%.02f, %.02f]", cilo, cihi),
+         p = ifelse(p.value < .001, "***", ifelse(p.value < .01, "**", ifelse(p.value < .05, " *", ""))),
+         Value = sprintf("%.02f (%.02f) %s", b, SE, p)) %>%
+  select(Predictor, Outcome, Value) %>%
+  pivot_wider(names_from = Outcome, values_from = Value) %>%
+  kable(digits = 2, caption = "Supplementary Table 4: Weighted linear regressions with standardized outcomes (SEs in parentheses, * = p < .05)") %>%
+  kable_styling(full_width = FALSE, latex_options = "hold_position") %>%
+  add_header_above(c(" " = 1, "Outcome Variable" = length(vars_outcome))) %>%
+  column_spec(2:11, width = "1.5cm")
+```
+
+\elandscape
+
+```{r exciting}
+exciting = survey %>%
+  filter(!is.na(socmed_trinary)) %>%
+  group_by(socmed_trinary) %>%
+  summarise(LifeExciting = survey_mean(life, na.rm = TRUE, vartype = "ci")) %>%
+  set_names(c("Social media use", "M", "low", "upp")) %>%
+  mutate(CI = sprintf("[%.02f, %.02f]", low, upp)) %>%
+  select(-low, -upp)
+
+exciting %>%
+  kable(digits = 2, caption = "Supplementary Table 5: Average values of finding life exciting (vs. dull)") %>%
+  kable_styling(full_width = FALSE, latex_options = "hold_position")
+```
+
+Additionally, the previously discussed positive finding of social media users considering life more exciting than non-users (*M* = `r sprintf("%.02f", exciting$M[1])`, 95% CI `r exciting$CI[1]`) appeared to be driven by intensive (*M* = `r sprintf("%.02f", exciting$M[3])`, 95% CI `r exciting$CI[3]`), but not moderate users (*M* = `r sprintf("%.02f", exciting$M[2])`, 95% CI `r exciting$CI[2]`).
+
+## 3.3 Multi-Platform Social Media Use and Well-Being Across Age
+
+```{r agemoderation}
+agemod = tibble()
+for(ii in vars_outcome){
+  s = mutate(survey, scaled_ii = scale(get(ii)))
+  mod = svyglm(reformulate("scale(age) * scale(socmed)", "scaled_ii"), s)
+  p.out = summary(mod)$coef
+  agemod = bind_rows(agemod, 
+                     p.out[-1, "Estimate"], 
+                     p.out[-1, "Std. Error"], 
+                     p.out[-1, "Pr(>|t|)"])
+}
+agemod = agemod %>%
+  mutate(Outcome = factor(rep(names(vars_outcome), each = 3), names(vars_outcome)),
+         Value = rep(c("Beta", "SE", "p"), length(vars_outcome))) %>%
+  gather("Coefficient", "nr", -Outcome, -Value) %>%
+  mutate(Coefficient = factor(Coefficient,
+                              c("scale(age)","scale(socmed)", "scale(age):scale(socmed)"),
+                              c("Age", "# Social media platforms", "Interaction")),
+         Coefficient = paste(Coefficient, Value, sep = ".")) %>%
+  select(-Value) %>%
+  spread(Coefficient, nr) 
+
+agemod %>%
+  select(Outcome, 
+         `# Social media platforms.Beta`, `# Social media platforms.SE`, `# Social media platforms.p`,
+         Age.Beta, Age.SE, Age.p, Interaction.Beta, Interaction.SE, Interaction.p) %>%
+  mutate_at(vars(c(`# Social media platforms.p`, Age.p, Interaction.p)), 
+            ~ifelse(. < .05, sprintf("%.03f*", .), sprintf("%.03f", .))) %>%
+  set_names(c("Outcome", rep(c("Beta", "SE", "p"), 3))) %>%
+  kable(digits = c(NA, 2, 2, 3, 2, 2, 3, 3, 2, 3), caption = "Supplementary Table 6: Weighted linear regressions with predictors and outcomes both standardized") %>%
+  kable_styling(full_width = FALSE, latex_options = "hold_position") %>%
+  add_header_above(c(" " = 1, "# Social media platforms" = 3, "Age" = 3, "Interaction" = 3))
+```
+
+Out of the ten well-being variables we examined, there were eight for which social media use intensity was unrelated to well-being in interaction with age (*p*s = `r sprintf("%.03f - %.03f", sort(agemod$Interaction.p)[3], sort(agemod$Interaction.p)[nrow(agemod)])`). One of these variables for which we found no such interaction ($\beta$ = `r round(filter(agemod, Outcome == "Ever breakdown")$Interaction.Beta, 2)`, *SE* = `r round(filter(agemod, Outcome == "Ever breakdown")$Interaction.SE, 2)`, *p* = `r round(filter(agemod, Outcome == "Ever breakdown")$Interaction.p, 3)`) was whether respondents had ever felt like they were going to have a mental breakdown
+
+### Figure 2
+
+Exploring the Age x Depression interaction:
+
+```{r Figure2, fig.cap="Figure 2. Linear regression lines for the interaction of social media usage intensity and age on symptoms of depression, plotted by age quartiles."}
+
+Figure2 = dat %>%
+  drop_na(socmed, cesd, age) %>%
+  ggplot(aes(x = socmed, y = cesd, color = age_q, group = age_q, linetype = age_q)) + 
+  stat_smooth(aes(weight = wtssall), method = "lm", se = FALSE) + 
+  theme_bw() + 
+  labs(x = "# Social Media Platforms", y = "CESD Depression Score", color = "Age Quartiles", 
+       linetype = "Age Quartiles") + 
+  scale_color_manual(values = c("gray65", "gray50", "gray35", "black")) + 
+  ylim(c(0, 3))
+Figure2
+
+svg("Figure2.svg", width = 5, height = 3.75)
+Figure2
+invisible(dev.off())
+```
+
+Or, plotting the interaction the other way around: 
+
+```{r Figure2alternative, fig.cap = "Supplementary Figure 2. Linear regression lines for the interaction of social media usage intensity and age on symptoms of depression, plotted by social media usage intensity."}
+dat %>%
+  drop_na(socmed, cesd, age) %>%
+  ggplot(aes(x = age, y = cesd, color = socmed_trinary, group = socmed_trinary, linetype = socmed_trinary)) +
+  geom_smooth(method = "lm", se = FALSE) + 
+  theme_bw() + 
+  ylim(0, 3) +
+  labs(x = "Age", y = "CESD Depression Score", color = "Social Media Use",
+       linetype = "Social Media Use") + 
+  scale_color_manual(values = c("gray65", "gray35", "black"))
+
+cor_cesdage.young.wt = svycor(~socmed+cesd, filter(survey, age <= 34), na.rm = TRUE, sig.stats = TRUE)
+cor_cesdage.middletoold.wt = svycor(~socmed+cesd, filter(survey, age > 34), na.rm = TRUE, sig.stats = TRUE)
+cor_cesdage.old.wt = svycor(~socmed+cesd, filter(survey, age > 35), na.rm = TRUE, sig.stats = TRUE)
+```
+
+For depression, middle-aged to older adults (top three quartiles of age, everyone over 34) report slightly higher depression with higher social media use, _r_ = `r round(cor_cesdage.middletoold.wt$cors[1,2], 2)`, _p_ `r print_p(cor_cesdage.middletoold.wt$p.value[1,2])`, but for younger adults (lowest quartile, 34 and younger), depression and social media use were unrelated, _r_ = `r round(cor_cesdage.young.wt$cors[1,2], 2)`, _p_ `r print_p(cor_cesdage.young.wt$p.value[1,2])` (Figure 2; interaction $\beta$ = `r sprintf("%.02f", filter(agemod, Outcome == "Depression")$Interaction.Beta)`, *SE* = `r round(filter(agemod, Outcome == "Depression")$Interaction.SE, 2)`, *p* = `r round(filter(agemod, Outcome == "Depression")$Interaction.p, 3)`)
+
+\newpage
+
+Exploring the Age x Social Trust interaction:
+
+```{r agetrustinteraction1, fig.cap = "Supplementary Figure 3a. Linear regression lines for the interaction of social media usage intensity and age on social trust, plotted by age quartiles. "}
+dat %>%
+  drop_na(socmed, soctrust, age) %>%
+  ggplot(aes(x = socmed, y = soctrust, color = age_q, group = age_q, linetype = age_q)) + 
+  stat_smooth(aes(weight = wtssall), method = "lm", se = FALSE) + 
+  theme_bw() + 
+  labs(x = "# Social Media Platforms", y = "Social Trust Composite Score", color = "Age Quartiles", 
+       linetype = "Age Quartiles") + 
+  scale_color_manual(values = c("gray65", "gray50", "gray35", "black")) + 
+  coord_cartesian(ylim = c(-1, 1))
+```
+
+
+```{r agetrustinteraction2, fig.cap = "Supplementary Figure 3b. Linear regression lines for the interaction of social media usage intensity and age on social trust, plotted by social media usage intensity."}
+dat %>%
+  drop_na(socmed, soctrust, age) %>%
+  ggplot(aes(x = age, y = soctrust, color = socmed_trinary, group = socmed_trinary, linetype = socmed_trinary)) +
+  geom_smooth(method = "lm", se = FALSE) + 
+  theme_bw() + 
+  coord_cartesian(ylim = c(-1, 1)) +
+  labs(x = "Age", y = "Social Trust Composite Score", color = "Social Media Use",
+       linetype = "Social Media Use") + 
+  scale_color_manual(values = c("gray65", "gray35", "black"))
+
+cor_trustage.young.wt = svycor(~socmed+soctrust, filter(survey, age <= 34), na.rm = TRUE, sig.stats = TRUE)
+cor_trustage.old.wt = svycor(~socmed+soctrust, filter(survey, age > 34), na.rm = TRUE, sig.stats = TRUE)
+```
+
+In addition, for social trust, the top three age quartiles (>34) report higher social trust with higher social media use _r_ = `r round(cor_trustage.old.wt$cors[1,2], 2)`, _p_ `r print_p(cor_trustage.old.wt$p.value[1,2])`, but young adults do not, _r_ = `r round(cor_trustage.young.wt$cors[1,2], 2)`, _p_ `r print_p(cor_trustage.young.wt$p.value[1,2])` (interaction $\beta$ = `r round(filter(agemod, Outcome == "Social trust")$Interaction.Beta, 2)`, *SE* = `r round(filter(agemod, Outcome == "Social trust")$Interaction.SE, 2)`, *p* = `r round(filter(agemod, Outcome == "Social trust")$Interaction.p, 3)`). 
+
+Three more variables showed no interaction between age and social media use, but were predicted by a main effect of social media use after controlling for mean-centered age: These included ever having felt like one would have a breakdown (the same negative association as in the bivariate results; $\beta$ = `r sprintf("%.02f", filter(agemod, Outcome == "Ever breakdown")["# Social media platforms.Beta"])`, *SE* = `r sprintf("%.02f", filter(agemod, Outcome == "Ever breakdown")["# Social media platforms.SE"])`, *p* = `r sprintf("%.03f", filter(agemod, Outcome == "Ever breakdown")["# Social media platforms.p"])`, finding one’s life exciting (the same positive association as in the bivariate results; $\beta$ = `r sprintf("%.02f", filter(agemod, Outcome == "Exciting vs. dull life")["# Social media platforms.Beta"])`, *SE* = `r sprintf("%.02f", filter(agemod, Outcome == "Exciting vs. dull life")["# Social media platforms.SE"])`, *p* = `r sprintf("%.03f", filter(agemod, Outcome == "Exciting vs. dull life")["# Social media platforms.p"])`), and confidence in social institutions (positive association with social media use; $\beta$ = `r sprintf("%.02f", filter(agemod, Outcome == "Confidence in soc. institutions")["# Social media platforms.Beta"])`, *SE* = `r sprintf("%.02f", filter(agemod, Outcome == "Confidence in soc. institutions")["# Social media platforms.SE"])`, *p* = `r sprintf("%.03f", filter(agemod, Outcome == "Confidence in soc. institutions")["# Social media platforms.p"])`). 
+
+\newpage
+\blandscape
+
+## 3.4 Specific platform use
+
+### Table 3
+
+```{r Table3}
+socmed_cors = svycor(
+  eval(parse(text = paste("~ age + socmed + ", 
+                          paste0(vars_platforms, collapse = " + ")))),
+  survey, na.rm = TRUE, sig.stats = TRUE
+)
+socmed_cors_age = tibble(sm = c("socmed", vars_platforms), 
+                         wb = "age",
+                         b = socmed_cors$cors[-1, 1], 
+                         p = socmed_cors$p.values[-1, 1])
+
+socmed_ctrlage = tibble()
+for(yy in c(vars_outcome, "soc")){
+  for(xx in c("socmed", vars_platforms)){
+    s = mutate(survey, wb = survey$variables[[yy]], sm = survey$variables[[xx]])
+    mod = summary(svyglm(scale(wb) ~ sm + scale(age), s))
+    socmed_ctrlage = bind_rows(socmed_ctrlage, tibble(sm = xx, wb = yy, b = mod$coef[2, 1], p = mod$coef[2, 4]))
+  }
+}
+socmed_ctrlage %>% 
+  bind_rows(socmed_cors_age) %>%
+  mutate(sm = factor(sm, c("socmed", vars_platforms), c("# platforms", names(vars_platforms))),
+         wb = factor(wb, c("age", vars_outcome, "soc"), 
+                     c("r with age", names(vars_outcome), "Offline social contacts")),
+         out = ifelse(p < .05,
+                      sprintf("%.02f", b),
+                      ifelse(wb == "r with age",
+                             sprintf("%.02f (ns)", b),
+                             NA))) %>%
+  select(-b, -p) %>%
+  spread(wb, out) %>%
+  rename(`Social Media Platform` = sm,
+         `Happi- ness` = Happiness,`Depre- ssion` = Depression,
+         `Financial satis- faction` = `Financial satisfaction`,
+         `Ever break- down` = `Ever breakdown`, 
+         `Relation- ship satis- faction` = `Relationship satisfaction`,
+         `Confidence in soc. insti- tutions` = `Confidence in soc. institutions`) %>%
+  kable(digits = 2, caption = "Table 3. Standardized linear regression coefficients for predicting well-being from use of social media platforms, controlling for age (the effect of age is shown separately in the second column). Only beta coefficients significant at p < .05 are shown (see Supplementary Table 7 for the full table with all coefficients.") %>% kable_styling(latex_options = "hold_position") %>%
+  column_spec(1:13, width = "1.5cm")
+```
+
+\newpage
+
+Or with all coefficients shown:
+
+```{r Table3alternative}
+socmed_ctrlage %>% 
+  bind_rows(socmed_cors_age) %>%
+  mutate(sm = factor(sm, c("socmed", vars_platforms), c("# platforms", names(vars_platforms))),
+         wb = factor(wb, c("age", vars_outcome, "soc"), 
+                     c("r with age", names(vars_outcome), "Offline social contacts")),
+         out = ifelse(p < .05, sprintf("%.02f (%.3f) *", b, p), sprintf("%.02f (%.3f)", b, p))) %>%
+  select(-b, -p) %>%
+  spread(wb, out) %>%
+  rename(`Social Media Platform` = sm,
+         `Happi- ness` = Happiness,`Depre- ssion` = Depression,
+         `Financial satis- faction` = `Financial satisfaction`,
+         `Ever break- down` = `Ever breakdown`, 
+         `Relation- ship satis- faction` = `Relationship satisfaction`,
+         `Confidence in soc. insti- tutions` = `Confidence in soc. institutions`) %>%
+  kable(digits = 2, caption = "Supplementary Table 7. Standardized linear regression coefficients for predicting well-being from use of social media platforms, controlling for age (the effect of age is shown separately in the second column). P-values shown in parentheses, * = p < .05.") %>% kable_styling(latex_options = "hold_position") %>%
+  column_spec(1:13, width = "1.5cm")
+```
+
+Income predicted well-being (e.g., _r_ = `r round(cor_happyincome.wt$cors[1,2], 2)`, _p_ `r print_p(cor_happyincome.wt$p.value[1,2])` for happiness)
+
+\newpage
+
+The same relationships, this time controlling for age (standardized), SES, the foreign family index, number of children, gender, city size (standardized), household population, race/ethnicity, the religiosity index, and the political conservatism index:
+
+```{r}
+socmed_ctrls = tibble()
+for(yy in c(vars_outcome, "soc")){
+  for(xx in c("socmed", vars_platforms)){
+    s = mutate(survey, wb = survey$variables[[yy]], sm = survey$variables[[xx]])
+    mod = summary(svyglm(scale(wb) ~ sm + scale(age) + ses + foreign + childs + male + scale(size) + hompop +
+                           race.hispanic + race.NHblack + race.NHwhite +
+                           religious + politically.conservative, s))
+    socmed_ctrls = bind_rows(socmed_ctrls, tibble(sm = xx, wb = yy, 
+                                                  b = mod$coef["sm", "Estimate"], p = mod$coef["sm","Pr(>|t|)"]))
+  }
+}
+socmed_ctrls %>% 
+  mutate(sm = factor(sm, c("socmed", vars_platforms), c("# platforms", names(vars_platforms))),
+         wb = factor(wb, c(vars_outcome, "soc"), 
+                     c(names(vars_outcome), "Offline social contacts")),
+         out = ifelse(p < .05,
+                      sprintf("%.02f (%.3f) *", b, p),
+                      sprintf("%.02f (%.3f)", b, p))) %>%
+  select(-b, -p) %>%
+  spread(wb, out) %>%
+  rename(`Social Media Platform` = sm,
+         `Happi- ness` = Happiness,
+         `Depre- ssion` = Depression,
+         `Financial satisfaction` = `Financial satisfaction`,
+         `Bad mental health days` = `Bad mental health days`,
+         `Exciting vs.dull life` = `Exciting vs. dull life`,
+         `Ever break- down` = `Ever breakdown`, 
+         `Relation- ship satis- faction` = `Relationship satisfaction`,
+         `Confidence in soc. insti- tutions` = `Confidence in soc. institutions`) %>%
+  kable(digits = 2, caption = "Supplementary Table 8. Linear regression coefficients for predicting standardized well-being from use of social media platforms, controlling for demographic characteristics. * = p < .05") %>% kable_styling(latex_options = "hold_position") %>%
+  column_spec(1:12, width = "1.5cm")
+```
+
+
+\elandscape
+
+\newpage
+
+## 3.5 Self-Selection Bias and Propensity-Score Adjustment
+
+```{r iptw}
+# specify the range of each variable to include this information in the table later on
+vars_outcome_range = map(vars_outcome, ~as.data.frame(t(range(dat[.], na.rm = TRUE)))) %>%
+  bind_rows %>%
+  mutate(Outcome = names(vars_outcome),
+         range = V2 - V1,
+         range.full = paste0(V1, " to ", V2))
+
+# IPTW with boot-strapped standard errors:
+fct_iptw_boot = function(data, index, var_outcome, var_predictor, vars_propensity, weights = "wtssall"){
+  # creating resampled dataframe
+  dat_psm = drop_na(data[index, ], id, vars_propensity, var_predictor, weights)
+  
+  # calculating propensity score
+  psm_use_model = glm(as.formula(paste0(var_predictor, " ~ ", paste(vars_propensity, collapse = " + "))), 
+                      dat_psm, family = "quasibinomial", weights = get(weights))
+  dat_psm$ps_use = predict(psm_use_model, type = "response")
+  
+  # calculating inverse-probability treatment weights and run the model with both these weights and the survey design weights
+  dat_psm$IPTW_weights = ifelse(dat_psm[var_predictor] == 1, 1/dat_psm$ps_use, 1/(1-dat_psm$ps_use))[,1]
+  model = lm(reformulate(var_predictor, var_outcome), data = dat_psm,
+             weights = wtssall * IPTW_weights)
+  
+  return(coef(model)[2])
+}
+
+# running the bootstrap and formatting the results
+# (in function form to easily repeat it for users vs. non-users and for intensive vs. non-intensive users):
+fct_iptw = function(var_predictor, vars_propensity = vars_propensity,
+                    vars_outcome = vars_outcome_std){
+  simple_lm = map(vars_outcome, 
+                  ~lm(formula = reformulate(var_predictor, .), 
+                      # use a dataset with all missing values excluded (so that the samples drawn in the bootstrap are
+                      #  all drawn from the same population as used in the linear models):
+                      data = drop_na(dat, id, vars_propensity, var_predictor, wtssall), 
+                      weights = wtssall))
+  
+  if(run_boot){
+    boot_out = map(
+      vars_outcome,
+      ~boot(fct_iptw_boot, R = 5000, data = dat, var_outcome = ., var_predictor = var_predictor, 
+            vars_propensity = vars_propensity))
+    boot_cis = map(boot_out, ~boot.ci(., type = "bca")) # replace with "basic" for shorter computation times
+    save(boot_out, boot_cis, file = ifelse(var_predictor == "socmed_intensive", 
+                                           "boot_output_intensive", "boot_output_user"))
+  } else load(ifelse(var_predictor == "socmed_intensive", "boot_output_intensive", "boot_output_user"))
+  names(boot_out) = names(boot_cis) = names(vars_outcome)
+  
+  # .$bca returns an unnamed vecto  r with 5 numbers; the lower and upper limits are elements 4 and 5
+  tab = map(boot_cis, ~as_tibble(t(.$bca[4:5]))) %>%
+    bind_rows %>%
+    set_names(c("ci.lo", "ci.hi")) %>%
+    mutate(Outcome = names(vars_outcome),
+           # `Outcome Range` = vars_outcome_range$range.full,
+           `Unadjusted beta` = map_dbl(simple_lm, ~coef(.)[2]),
+           baseline.p = map_dbl(simple_lm, ~summary(.)$coef[var_predictor, "Pr(>|t|)"]),
+           `IPTW average beta` = map_dbl(boot_out, ~mean(.$t)),
+           `IPTW 95% CI` = sprintf('[%.2f, %.2f]', ci.lo, ci.hi),
+           variable.range = vars_outcome_range$range,
+           # `% of range` = percent(`IPTW average beta` / vars_outcome_range$range),
+           flag = ifelse((ci.lo > 0) == (ci.hi > 0), "*", ""),
+           `Unadjusted beta` = ifelse(baseline.p < .05, sprintf("%.02f*", `Unadjusted beta`), sprintf("%.02f", `Unadjusted beta`)),
+           `IPTW average beta` = sprintf("%.02f%s", `IPTW average beta`, flag)) %>%
+    select(-ci.lo, -ci.hi, -variable.range, -flag, -baseline.p)
+  
+  # proportion of bootstrap results that are <= 0:
+  boot_0orsmaller = map_dbl(boot_out, ~prop.table(table(.$t <= 0))["TRUE"]) 
+  
+  return(list(tab = tab, boot_0orsmaller = boot_0orsmaller))
+}
+```
+
+Religiosity and respondent income were not included in the list of covariates because of relatively high proportions of missing data; including these variables would have reduced the effective sample size from `r nrow(drop_na(dat, vars_propensity))` to `r nrow(drop_na(dat, vars_propensity, reliten, rincome.midpoint))`.
+
+### Table 4
+
+```{r Table4, escape = TRUE}
+iptw_user = fct_iptw("socmed_binarycalc",
+                     vars_propensity = vars_propensity,
+                     vars_outcome = vars_outcome_std)
+iptw_intensive = fct_iptw("socmed_intensive",
+                          vars_propensity = vars_propensity,
+                          vars_outcome = vars_outcome_std)
+
+bind_rows(iptw_user$tab,
+          iptw_intensive$tab) %>%
+  kable(digits = 2) %>% 
+  kable_styling(full_width = FALSE, latex_options = "hold_position") %>%
+  pack_rows("Social media users (1) vs. non-users (0)", 1, length(vars_outcome)) %>%
+  pack_rows("Intensive social media users (1; 6+ platforms) vs. moderate users and non-users (0; 0-5 platforms)",
+            1+length(vars_outcome), length(vars_outcome)*2)
+```
+
+The effect of social media use (vs. non-use) on ever having felt like having a breakdown was substantially reduced when adjusting for the propensity score (`r filter(iptw_user$tab, Outcome == "Ever breakdown")["IPTW average beta"]` vs. `r str_remove(filter(iptw_user$tab, Outcome == "Ever breakdown")["Unadjusted beta"], "\\*")` without adjustment) and in `r 100*round(iptw_user$boot_0orsmaller["Ever breakdown"], 2)`% of the bootstrap replicates, the effect was zero or smaller.
+
+# 4. General Discussion
+
+# 5. Conclusion
+
