@@ -1,6 +1,6 @@
 ---
 title: "GSS 2016: Social Media Usage module"
-author: "Sophie Lohmann, Emilio Zagheni"
+author: "Blinded for peer review"
 date: "Last updated: `r format(Sys.Date(), '%B %d, %Y')`"
 header-includes:
 - \usepackage{pdflscape}
