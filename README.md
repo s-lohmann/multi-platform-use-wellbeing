@@ -15,7 +15,7 @@ The data were obtained from https://gss.norc.org/Documents/spss/2016_spss.zip . 
 
 (1) Download and unzip data from: https://gss.norc.org/Documents/spss/2016_spss.zip 
 
-(2) Store the dataset `GSS2016.sav` in the same folder as the script `GSS_MultiPlatformUse_Supplementary.Rmd`. Open the script in R and make sure that your working directory is set to that folder.
+(2) Store the dataset `GSS2016.sav` in the same folder as the scripts `GSS_helperfunctions.R` and `GSS_MultiPlatformUse_Supplementary.Rmd`. Open the `GSS_MultiPlatformUse_Supplementary.Rmd` script in R and make sure that your working directory is set to that folder.
 
 (3) If `run_boot = FALSE`, that folder also needs to include two files with previously saved results of the bootstrap analyses (`boot_output_user` and `boot_output_intensive`). If you instead wish to rerun the bootstrap analyses from scratch, these files do not need to exist, set `run_boot = TRUE` to run the results and then store the output yourself.
 
