@@ -47,6 +47,10 @@ library(patchwork) # to combine ggplot objects into one graph
 library(cowplot) # for graphics options
 # gdata warning messages about perl interpreters and Excel integration can be ignored here, support for Excel files is not needed for this project
 
+# importing customized functions that overwrite the svycor function and a function that it draws on
+# to also return bootstrap CIs, not just SEs for weighted correlation tests
+source("GSS_helperfunctions.R")
+
 # setting knitr options
 knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, fig.align = "center")
 options(knitr.kable.NA = '')
@@ -650,33 +654,39 @@ cors.wt.all = svycor(
                           paste0(vars_outcome, collapse = " + ")))), 
   survey, na.rm = TRUE, sig.stats = TRUE)
 
+cors.wt.out = matrix(
+  sprintf("%.02f%s %s", cors.wt.all$cors, ifelse(cors.wt.all$p.values < .05, "*", ""), cors.wt.all$ci),
+  dim(cors.wt.all$cors)[1], dim(cors.wt.all$cors)[2])
+
 cors.wt.p = as.data.frame(rbind(
   cors.wt.all$p.values[-c(1:2), c(1:2)], 
   cors.wt.all$p.values[2, c(1:2)]))
+
+cors.wt.ci = as.data.frame(rbind(
+  cors.wt.all$ci[-c(1:2), c(1:2)], 
+  cors.wt.all$ci[2, c(1:2)]))
+
 cors.wt = as.data.frame(cbind(
   c(names(vars_outcome), "Offline social contact"),
   rbind(
     cors.wt.all$cors[-c(1:2), c(1:2)],
     cors.wt.all$cors[2, c(1:2)]), 
-  cors.wt.p))
+  cors.wt.p,
+  cors.wt.ci))
 
-colnames(cors.wt) = c("Outcome", "Online social contact", "Offline social contact", "online.p", "offline.p")
+cors.wt.out = as.data.frame(rbind(cors.wt.out[-c(1:2), c(1:2)],
+                                  cors.wt.out[2, c(1:2)]))
 
-cors.wt %>%
-  mutate(`Online social contact` = 
-           ifelse(online.p < .05, 
-                  sprintf("%.02f*", `Online social contact`),
-                  sprintf("%.02f", `Online social contact`)),
-         `Offline social contact` = 
-           ifelse(offline.p < .05, 
-                  sprintf("%.02f*", `Offline social contact`),
-                  sprintf("%.02f", `Offline social contact`)),
+colnames(cors.wt.out) = c("Online social contact", "Offline social contact")
+
+cors.wt.out %>%
+  mutate(Outcome = c(names(vars_outcome), "Offline social contact"),
          `Offline social contact` = 
            ifelse(Outcome == "Offline social contact", 
                   NA,
                   ifelse(Outcome %in% c("Depression", "Depression (reduced scale)",
                                         "Restless sleep", "Loneliness"), 
-                         "\\+", `Offline social contact`))) %>%
+                         "\\+", as.character(`Offline social contact`)))) %>%
   select(Outcome, `Online social contact`, `Offline social contact`) %>%
   kable(digits = 2, caption = "Table 2. Correlations of Social Contact and Well-Being") %>%
   kable_styling(full_width = FALSE, latex_options = "hold_position")
